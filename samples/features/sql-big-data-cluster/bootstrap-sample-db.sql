@@ -1,14 +1,5 @@
 USE master;  
 GO
--- Create login root that is part of sysadmin. You can then login as root to get the integrated
--- login experience in Azure Data Studio
-IF SUSER_SID('root') IS NULL
-BEGIN
-	CREATE LOGIN root WITH PASSWORD = '$(SA_PASSWORD)';
-	ALTER SERVER ROLE sysadmin ADD MEMBER root;
-END;
-GO
-
 -- Enable external scripts execution for R/Python/Java:
 DECLARE @config_option nvarchar(100) = 'external scripts enabled';
 IF NOT EXISTS(SELECT * FROM sys.configurations WHERE name = @config_option and value_in_use = 1)
@@ -80,35 +71,34 @@ CREATE OR ALTER PROCEDURE #create_data_sources
 AS
 BEGIN
 	-- Create database master key (required for database scoped credentials used in the samples)
-	IF NOT EXISTS(SELECT * FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMasterKey##')
-		CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'sql19bigdatacluster!';
+	CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'sql19bigdatacluster!';
 
 	-- Create default data sources for SQL Big Data Cluster
-	IF NOT EXISTS(SELECT * FROM sys.external_data_sources WHERE name = 'SqlDataPool')
-		CREATE EXTERNAL DATA SOURCE SqlDataPool
-		WITH (LOCATION = 'sqldatapool://controller-svc/default');
+	CREATE EXTERNAL DATA SOURCE SqlComputePool
+	WITH (LOCATION = 'sqlcomputepool://controller-svc/default');
 
-	IF NOT EXISTS(SELECT * FROM sys.external_data_sources WHERE name = 'SqlStoragePool')
-		CREATE EXTERNAL DATA SOURCE SqlStoragePool
-		WITH (LOCATION = 'sqlhdfs://controller-svc/default');
+	CREATE EXTERNAL DATA SOURCE SqlDataPool
+	WITH (LOCATION = 'sqldatapool://controller-svc/default');
 
-	IF NOT EXISTS(SELECT * FROM sys.external_data_sources WHERE name = 'HadoopData')
-		CREATE EXTERNAL DATA SOURCE HadoopData
-		WITH(
-				TYPE=HADOOP,
-				LOCATION='hdfs://nmnode-0-svc:9000/',
-				RESOURCE_MANAGER_LOCATION='sparkhead-svc:8032'
-		);
+	CREATE EXTERNAL DATA SOURCE SqlStoragePool
+	WITH (LOCATION = 'sqlhdfs://controller-svc/default');
+
+	CREATE EXTERNAL DATA SOURCE HadoopData
+	WITH(
+			TYPE=HADOOP,
+			LOCATION='hdfs://nmnode-0-svc:9000/',
+			RESOURCE_MANAGER_LOCATION='sparkhead-svc:8032'
+	);
 END;
 GO
 
 --- Sample dbs:
 DECLARE @sample_dbs CURSOR, @proc nvarchar(255);
 SET @sample_dbs = CURSOR FAST_FORWARD FOR
-									SELECT file_or_directory_name, d.db_name
-									FROM sys.dm_os_enumerate_filesystem('/var/opt/mssql/data', '*.bak') as f
-									CROSS APPLY (VALUES(REPLACE(REPLACE(file_or_directory_name, 'tpcxbb_1gb', 'sales'), '.bak', ''))) as d(db_name)
-									WHERE DB_ID(d.db_name) IS NULL;
+					SELECT file_or_directory_name, d.db_name
+					FROM sys.dm_os_enumerate_filesystem('/var/opt/mssql/data', '*.bak') as f
+					CROSS APPLY (VALUES(REPLACE(REPLACE(file_or_directory_name, 'tpcxbb_1gb', 'sales'), '.bak', ''))) as d(db_name)
+					WHERE DB_ID(d.db_name) IS NULL;
 DECLARE @file nvarchar(260), @db_name nvarchar(128);														
 OPEN @sample_dbs;
 WHILE(1=1)
@@ -119,10 +109,8 @@ BEGIN
 	-- Restore the sample databases:
 	EXECUTE #restore_database @file, @db_name;
 
-	-- Get database name used in restore:
-	SET @db_name = QUOTENAME(@db_name);
-	SET @proc = CONCAT(@db_name, N'.sys.sp_executesql');
-
+	-- Create context for database:
+	SET @proc = CONCAT(QUOTENAME(@db_name), N'.sys.sp_executesql');
 	EXECUTE @proc N'#create_data_sources';
 
 	-- Set compatibility level to 150:
@@ -132,17 +120,24 @@ BEGIN
 	IF SERVERPROPERTY('IsHadrEnabled') = 1
 	BEGIN
 		DECLARE @command nvarchar(1000);
-		IF EXISTS(SELECT * FROM sys.databases WHERE name = PARSENAME(@db_name,1) and recovery_model_desc = 'SIMPLE')
-		BEGIN
+		IF EXISTS(SELECT * FROM sys.databases WHERE name = @db_name and recovery_model_desc <> 'FULL')
 			-- Set recovery to full
 			EXECUTE @proc N'ALTER DATABASE CURRENT SET RECOVERY FULL';
 
-			SET @command = CONCAT(N'BACKUP DATABASE ', @db_name, ' TO DISK = ''NUL'';' );
-			EXEC(@command);
-		END;
+		-- Workaround to avoid hk snapshot backup error (happens with wwidw & awdw dbs)
+		BEGIN TRY
+			-- Perform database & log backup to file to start a new chain
+			BACKUP DATABASE @db_name TO DISK = 'NUL' WITH INIT, FORMAT;
+		END TRY
+		BEGIN CATCH
+			-- Retry backup again
+			BACKUP DATABASE @db_name TO DISK = 'NUL' WITH INIT, FORMAT;
+		END CATCH;
+
+		BACKUP LOG @db_name TO DISK = 'NUL' WITH INIT, FORMAT;
 
 		-- Add database to AG
-		SET @command = CONCAT(N'ALTER AVAILABILITY GROUP containedag ADD DATABASE ', @db_name);
+		SET @command = CONCAT(N'ALTER AVAILABILITY GROUP containedag ADD DATABASE ', QUOTENAME(@db_name));
 		EXEC(@command);
 	END;
 END;
